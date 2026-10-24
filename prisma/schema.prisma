@@ -1,0 +1,484 @@
+// BizSite database schema.
+// Every tenant-owned table carries `businessId`; services always filter by the
+// business resolved from the authenticated user's membership, never by a
+// client-supplied id.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  SUPER_ADMIN
+  BUSINESS_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum BusinessStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+/// Permission level of a user inside one business.
+/// OWNER: full control (incl. publishing when the business allows it).
+/// EDITOR: manage content and enquiries, cannot publish or change settings.
+enum MembershipRole {
+  OWNER
+  EDITOR
+}
+
+enum ProductStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum PriceVisibility {
+  SHOW
+  CONTACT_FOR_PRICE
+}
+
+enum EnquiryStatus {
+  NEW
+  IN_PROGRESS
+  RESOLVED
+  SPAM
+}
+
+enum WebsiteTemplate {
+  MODERN_CATALOGUE
+  PROFESSIONAL_BUSINESS
+}
+
+enum SectionType {
+  ANNOUNCEMENT_BAR
+  HEADER
+  HERO
+  ABOUT
+  FEATURED_PRODUCTS
+  CATEGORIES
+  CATALOGUE
+  WHY_CHOOSE_US
+  GALLERY
+  TESTIMONIALS
+  CONTACT_INFO
+  WHATSAPP_CTA
+  ENQUIRY_FORM
+  FOOTER
+}
+
+// ─── Authentication (shape required by Better Auth) ─────────────────────────
+
+model User {
+  id            String     @id @default(cuid())
+  name          String
+  email         String     @unique
+  emailVerified Boolean    @default(false)
+  image         String?
+  role          UserRole   @default(BUSINESS_ADMIN)
+  status        UserStatus @default(ACTIVE)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  sessions            Session[]
+  accounts            Account[]
+  memberships         BusinessMembership[]
+  invitationsSent     Invitation[]         @relation("InvitedBy")
+  auditLogs           AuditLog[]
+  websitePublications WebsitePublication[]
+
+  @@index([role])
+  @@map("users")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  ipAddress String?
+  userAgent String?
+  userId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// Credential accounts store the password hash in `password` (scrypt, via Better Auth).
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verifications")
+}
+
+/// Better Auth's rate-limit store for /api/auth/* endpoints.
+model RateLimit {
+  id          String @id
+  key         String @unique
+  count       Int
+  lastRequest BigInt
+
+  @@map("auth_rate_limits")
+}
+
+// ─── Tenancy ────────────────────────────────────────────────────────────────
+
+model Business {
+  id             String         @id @default(cuid())
+  name           String
+  slug           String         @unique
+  category       String
+  description    String?
+  logoUrl        String?
+  email          String?
+  phone          String?
+  /// Digits only, including country code (e.g. 919876543210).
+  whatsappNumber String?
+  addressLine    String?
+  city           String?
+  state          String?
+  postalCode     String?
+  /// Validated weekly schedule, see src/lib/validators/business.ts.
+  openingHours   Json?
+  /// Validated map of social network -> https URL.
+  socialLinks    Json?
+  currency       String         @default("INR")
+  status         BusinessStatus @default(ACTIVE)
+  /// Non-null while the website is live.
+  publishedAt    DateTime?
+
+  // Feature flags controlled by the super admin.
+  allowSelfPublish Boolean @default(true)
+  enquiriesEnabled Boolean @default(true)
+  whatsappEnabled  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   BusinessMembership[]
+  invitations   Invitation[]
+  categories    Category[]
+  products      Product[]
+  websiteConfig WebsiteConfig?
+  sections      WebsiteSection[]
+  publications  WebsitePublication[]
+  enquiries     Enquiry[]
+  mediaAssets   MediaAsset[]
+
+  @@index([status])
+  @@index([category])
+  @@index([name])
+  @@map("businesses")
+}
+
+model BusinessMembership {
+  id         String         @id @default(cuid())
+  userId     String
+  businessId String
+  role       MembershipRole @default(OWNER)
+  createdAt  DateTime       @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+  @@map("business_memberships")
+}
+
+/// Invitation for a business administrator. Only a SHA-256 hash of the token is stored.
+model Invitation {
+  id          String         @id @default(cuid())
+  email       String
+  name        String?
+  businessId  String
+  role        MembershipRole @default(OWNER)
+  tokenHash   String         @unique
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  invitedById String?
+  createdAt   DateTime       @default(now())
+
+  business  Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invitedBy User?    @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@index([businessId])
+  @@index([email])
+  @@map("invitations")
+}
+
+// ─── Catalogue ──────────────────────────────────────────────────────────────
+
+model Category {
+  id          String   @id @default(cuid())
+  businessId  String
+  name        String
+  slug        String
+  description String?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  @@unique([businessId, slug])
+  @@index([businessId, sortOrder])
+  @@map("categories")
+}
+
+model Product {
+  id               String          @id @default(cuid())
+  businessId       String
+  categoryId       String?
+  name             String
+  slug             String
+  shortDescription String?
+  description      String?
+  sku              String?
+  /// Price in minor units of the business currency (e.g. paise). Never a float.
+  priceMinor       Int?
+  priceVisibility  PriceVisibility @default(SHOW)
+  featuredImageUrl String?
+  status           ProductStatus   @default(DRAFT)
+  isFeatured       Boolean         @default(false)
+  sortOrder        Int             @default(0)
+  seoTitle         String?
+  seoDescription   String?
+  publishedAt      DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  business  Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  category  Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  images    ProductImage[]
+  enquiries Enquiry[]
+
+  @@unique([businessId, slug])
+  @@unique([businessId, sku])
+  @@index([businessId, status, sortOrder])
+  @@index([businessId, categoryId])
+  @@index([businessId, isFeatured])
+  @@map("products")
+}
+
+/// Gallery images of a product (the featured image lives on Product).
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String
+  url       String
+  alt       String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, sortOrder])
+  @@map("product_images")
+}
+
+// ─── Website builder ────────────────────────────────────────────────────────
+
+/// The columns hold the DRAFT theme; `publishedConfig` holds the validated
+/// snapshot (theme + sections) that the public website renders.
+model WebsiteConfig {
+  id                 String          @id @default(cuid())
+  businessId         String          @unique
+  template           WebsiteTemplate @default(MODERN_CATALOGUE)
+  primaryColor       String          @default("#1f4d3a")
+  secondaryColor     String          @default("#13231b")
+  accentColor        String          @default("#d97706")
+  fontFamily         String          @default("inter")
+  logoSettings       Json
+  navigationSettings Json
+  footerSettings     Json
+  seoSettings        Json
+  publishedConfig    Json?
+  lastPublishedAt    DateTime?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("website_configs")
+}
+
+/// Draft homepage sections. One row per section type per business.
+model WebsiteSection {
+  id         String      @id @default(cuid())
+  businessId String
+  type       SectionType
+  title      String?
+  subtitle   String?
+  /// Validated per section type, see src/lib/website/sections.ts.
+  content    Json
+  imageUrl   String?
+  imageAlt   String?
+  sortOrder  Int         @default(0)
+  isVisible  Boolean     @default(true)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, type])
+  @@index([businessId, sortOrder])
+  @@map("website_sections")
+}
+
+/// Publishing history: every publish stores the exact snapshot that went live.
+model WebsitePublication {
+  id            String   @id @default(cuid())
+  businessId    String
+  snapshot      Json
+  publishedById String?
+  createdAt     DateTime @default(now())
+
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  publishedBy User?    @relation(fields: [publishedById], references: [id], onDelete: SetNull)
+
+  @@index([businessId, createdAt])
+  @@map("website_publications")
+}
+
+// ─── Enquiries ──────────────────────────────────────────────────────────────
+
+model Enquiry {
+  id           String        @id @default(cuid())
+  businessId   String
+  productId    String?
+  customerName String
+  email        String?
+  phone        String?
+  message      String
+  status       EnquiryStatus @default(NEW)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  product  Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, status, createdAt])
+  @@index([createdAt])
+  @@map("enquiries")
+}
+
+// ─── Media ──────────────────────────────────────────────────────────────────
+
+model MediaAsset {
+  id           String   @id @default(cuid())
+  /// Null for platform-owned assets.
+  businessId   String?
+  storageKey   String   @unique
+  url          String
+  mimeType     String
+  sizeBytes    Int
+  altText      String?
+  uploadedById String?
+  createdAt    DateTime @default(now())
+
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, createdAt])
+  @@index([url])
+  @@map("media_assets")
+}
+
+// ─── Platform ───────────────────────────────────────────────────────────────
+
+/// Audit trail of important actions. Not a foreign key to Business so the
+/// trail survives business deletion.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  businessId String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+/// Singleton row (id = "platform").
+model PlatformSetting {
+  id                  String            @id @default("platform")
+  platformName        String            @default("BizSite")
+  supportEmail        String?
+  defaultTemplate     WebsiteTemplate   @default(MODERN_CATALOGUE)
+  enabledTemplates    WebsiteTemplate[]
+  enabledSectionTypes SectionType[]
+  updatedAt           DateTime          @updatedAt
+
+  @@map("platform_settings")
+}
+
+/// "Request a website" submissions from the marketing site's contact page.
+model WebsiteRequest {
+  id           String   @id @default(cuid())
+  name         String
+  email        String
+  phone        String?
+  businessName String
+  category     String?
+  message      String?
+  handled      Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("website_requests")
+}
+
+/// Fixed-window counters for public form / upload abuse control.
+model ThrottleBucket {
+  key         String   @id
+  windowStart DateTime
+  count       Int
+
+  @@map("throttle_buckets")
+}
